@@ -1,0 +1,105 @@
+!pip install --upgrade pip
+!pip install -U "torch==2.2.2" "transformers==4.40.1" "datasets==3.5.1" "scikit-learn" "matplotlib" "gradio==4.28.3" "fsspec==2025.3.2"
+!pip install transformers datasets scikit-learn gradio matplotlib
+
+
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+import gradio as gr
+import os
+
+# Use uploaded file
+df = pd.read_csv("train.csv")
+
+# Clean Data
+df.dropna(inplace=True)
+df['text'] = df['text'].apply(lambda x: str(x).strip().lower())
+df['reason'] = df['reason'].apply(lambda x: str(x).strip().lower())
+df['label'] = df['label'].astype(int)
+
+# Augment label 0 examples
+positive_df = df[df['label'] == 1]
+negative_df = df[df['label'] == 0]
+aug_negatives = []
+for i in range(min(len(positive_df), 500)):
+    t = positive_df.iloc[i]['text']
+    r = positive_df.iloc[-(i+1)]['reason']
+    if t != r:
+        aug_negatives.append({'text': t, 'reason': r, 'label': 0})
+augmented_df = pd.DataFrame(aug_negatives)
+df = pd.concat([df, augmented_df]).reset_index(drop=True)
+
+# Tokenizer
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+class FeedbackDataset(Dataset):
+    def _init_(self, texts, reasons, labels):
+        self.encodings = tokenizer(list(texts), list(reasons), truncation=True, padding=True, return_tensors="pt")
+        self.labels = torch.tensor(labels.tolist(), dtype=torch.long)
+
+    def _getitem_(self, idx):
+        item = {k: v[idx] for k, v in self.encodings.items()}
+        item["labels"] = self.labels[idx]
+        return item
+
+    def _len_(self):
+        return len(self.labels)
+
+train_texts, val_texts, train_reasons, val_reasons, train_labels, val_labels = train_test_split(
+    df['text'], df['reason'], df['label'], test_size=0.2, random_state=42)
+
+train_dataset = FeedbackDataset(train_texts, train_reasons, train_labels)
+val_dataset = FeedbackDataset(val_texts, val_reasons, val_labels)
+
+model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
+
+training_args = TrainingArguments(
+    output_dir="./results",
+    num_train_epochs=1,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    logging_dir="./logs",
+    logging_steps=10,
+    save_strategy="no",
+    eval_steps=500,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+)
+os.environ["WANDB_DISABLED"] = "true"
+trainer.train()
+
+# Evaluation
+preds = trainer.predict(val_dataset)
+y_true = val_labels.tolist()
+y_pred = preds.predictions.argmax(-1).tolist()
+print("\nEvaluation Report:\n", classification_report(y_true, y_pred))
+cm = confusion_matrix(y_true, y_pred)
+ConfusionMatrixDisplay(cm).plot(cmap="Blues", values_format="d")
+plt.title("Confusion Matrix")
+plt.show()
+
+# Gradio Interface
+def classify_feedback(text, reason):
+    inputs = tokenizer(text, reason, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    pred = torch.argmax(outputs.logits, dim=1).item()
+    return "✅ Aligned" if pred == 1 else "❌ Not Aligned"
+
+gr.Interface(
+    fn=classify_feedback,
+    inputs=["text", "text"],
+    outputs="text",
+    title="📘 EdTech Feedback Validator",
+    description="Check if the user feedback matches the dropdown reason. Powered by BERT."
+).launch(share=True)
